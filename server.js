@@ -4,9 +4,19 @@ const cors = require('cors');
 const axios = require('axios');
 const crypto = require('crypto');
 
+
 const app = express();
 app.use(cors());
-app.use(express.json());
+
+// ═══ Body parser — webhook ke liye raw, baaki ke liye JSON ═══
+app.use((req, res, next) => {
+    if (req.originalUrl === '/api/webhook') {
+        express.raw({ type: 'application/json' })(req, res, next);
+    } else {
+        express.json()(req, res, next);
+    }
+});
+
 
 // ═══ FIREBASE SETUP ═══
 const admin = require('firebase-admin');
