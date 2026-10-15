@@ -4,21 +4,113 @@ const cors = require('cors');
 const axios = require('axios');
 const crypto = require('crypto');
 
-
 const app = express();
 app.use(cors());
 
-// ═══ Body parser — webhook ke liye raw, baaki ke liye JSON ═══
-app.use((req, res, next) => {
-    if (req.originalUrl === '/api/webhook') {
-        express.raw({ type: 'application/json' })(req, res, next);
-    } else {
-        express.json()(req, res, next);
+/* ═══════════════════════════════════════════════════════
+   WEBHOOK ROUTE — MUST BE FIRST (before express.json)
+   Raw body chahiye signature verify karne ke liye
+   ═══════════════════════════════════════════════════════ */
+const APINEPAL_WEBHOOK_SECRET = process.env.APINEPAL_WEBHOOK_SECRET;
+
+app.post(
+    '/api/webhook',
+    express.raw({ type: '*/*', limit: '5mb' }),
+    async (req, res) => {
+        try {
+            console.log('📥 Webhook received');
+            console.log('   Headers:', JSON.stringify(req.headers));
+
+            const signature = req.headers['x-anp-signature'] || req.headers['x-signature'];
+            const bodyBuffer = req.body;
+            const bodyStr = Buffer.isBuffer(bodyBuffer) ? bodyBuffer.toString('utf8') : String(bodyBuffer || '');
+
+            console.log('   Body length:', bodyStr.length);
+            console.log('   Body preview:', bodyStr.substring(0, 300));
+
+            // ═══ Verify signature ═══
+            if (APINEPAL_WEBHOOK_SECRET && signature) {
+                const expectedSig = crypto
+                    .createHmac('sha256', APINEPAL_WEBHOOK_SECRET)
+                    .update(bodyStr)
+                    .digest('hex');
+
+                if (signature !== expectedSig) {
+                    console.warn('❌ Signature mismatch');
+                    console.warn('   Expected:', expectedSig);
+                    console.warn('   Got:', signature);
+                    // Still return 200 to avoid retries during testing
+                    // Change to 401 later if you want strict
+                    return res.status(200).json({ received: true, warning: 'signature_mismatch' });
+                }
+                console.log('✅ Signature verified');
+            } else {
+                console.log('⚠️ No signature or secret — skipping verify');
+            }
+
+            // ═══ Parse event ═══
+            let event = {};
+            try {
+                event = bodyStr ? JSON.parse(bodyStr) : {};
+            } catch (e) {
+                console.warn('⚠️ JSON parse failed:', e.message);
+            }
+
+            console.log('📦 Event type:', event.type || event.status || 'unknown');
+
+            const orderId = event.data?.order_id || event.order_id;
+            const status = event.type || event.status;
+
+            // ═══ Update Firebase ═══
+            const admin = require('firebase-admin');
+            const db = (admin.apps && admin.apps.length) ? admin.database() : null;
+
+            if (db && orderId) {
+                if (status === 'payment.success' || status === 'success' || status === 'completed') {
+                    await db.ref('orders/' + orderId).update({
+                        status: 'Processing',
+                        paymentStatus: 'paid',
+                        paidAt: Date.now(),
+                        transactionId: event.data?.transaction_id || '',
+                        webhookData: event
+                    });
+                    console.log('✅ Order marked PAID:', orderId);
+                } else if (status === 'payment.failed' || status === 'failed') {
+                    await db.ref('orders/' + orderId).update({
+                        status: 'Cancelled',
+                        paymentStatus: 'failed',
+                        failedAt: Date.now(),
+                        webhookData: event
+                    });
+                    console.log('❌ Order marked FAILED:', orderId);
+                } else if (status === 'payment.testevent' || status === 'testevent') {
+                    console.log('🧪 Test event received — all good!');
+                } else {
+                    console.log('ℹ️ Unhandled event type:', status);
+                }
+            } else {
+                console.log('⚠️ Missing db or orderId — skipping update');
+            }
+
+            // ═══ Always return 200 ═══
+            res.status(200).json({ received: true });
+
+        } catch (error) {
+            console.error('❌ Webhook handler error:', error);
+            // Return 200 so API Nepal doesn't retry infinitely
+            res.status(200).json({ received: true, error: error.message });
+        }
     }
-});
+);
 
+/* ═══════════════════════════════════════════════════════
+   NOW parse JSON for all OTHER routes
+   ═══════════════════════════════════════════════════════ */
+app.use(express.json({ limit: '5mb' }));
 
-// ═══ FIREBASE SETUP ═══
+/* ═══════════════════════════════════════════════════════
+   FIREBASE INIT
+   ═══════════════════════════════════════════════════════ */
 const admin = require('firebase-admin');
 
 try {
@@ -38,14 +130,17 @@ try {
 
 const db = admin.apps && admin.apps.length ? admin.database() : null;
 
-// ═══ CONFIG ═══
+/* ═══════════════════════════════════════════════════════
+   CONFIG
+   ═══════════════════════════════════════════════════════ */
 const APINEPAL_API_KEY = process.env.APINEPAL_API_KEY;
 const APINEPAL_SECRET_KEY = process.env.APINEPAL_SECRET_KEY;
-const APINEPAL_WEBHOOK_SECRET = process.env.APINEPAL_WEBHOOK_SECRET;
 const APINEPAL_BASE_URL = process.env.APINEPAL_BASE_URL || 'https://apinepal.com/api/v1';
-const BASE_URL = process.env.BASE_URL || 'https://your-backend.onrender.com';
+const BASE_URL = process.env.BASE_URL || 'https://siddiquepay-backend.onrender.com';
 
-// ═══ ROUTE 1: CREATE PAYMENT ═══
+/* ═══════════════════════════════════════════════════════
+   ROUTE 1: CREATE PAYMENT
+   ═══════════════════════════════════════════════════════ */
 app.post('/api/create-payment', async (req, res) => {
     try {
         const { amount, orderId, customerName, customerPhone, packageName } = req.body;
@@ -90,7 +185,9 @@ app.post('/api/create-payment', async (req, res) => {
     }
 });
 
-// ═══ ROUTE 2: PAYMENT STATUS ═══
+/* ═══════════════════════════════════════════════════════
+   ROUTE 2: PAYMENT STATUS
+   ═══════════════════════════════════════════════════════ */
 app.get('/api/payment-status/:orderId', async (req, res) => {
     try {
         const { orderId } = req.params;
@@ -126,7 +223,9 @@ app.get('/api/payment-status/:orderId', async (req, res) => {
     }
 });
 
-// ═══ ROUTE 3: CANCEL PAYMENT ═══
+/* ═══════════════════════════════════════════════════════
+   ROUTE 3: CANCEL PAYMENT
+   ═══════════════════════════════════════════════════════ */
 app.post('/api/cancel-payment', async (req, res) => {
     try {
         const { orderId } = req.body;
@@ -162,74 +261,24 @@ app.post('/api/cancel-payment', async (req, res) => {
     }
 });
 
-// ═══ ROUTE 4: WEBHOOK ═══
-app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-    try {
-        const signature = req.headers['x-anp-signature'] || req.headers['x-signature'];
-        const body = req.body.toString();
-
-        console.log('📥 Webhook received');
-
-        if (APINEPAL_WEBHOOK_SECRET && signature) {
-            const expectedSig = crypto
-                .createHmac('sha256', APINEPAL_WEBHOOK_SECRET)
-                .update(body)
-                .digest('hex');
-
-            if (signature !== expectedSig) {
-                console.warn('❌ Invalid webhook signature');
-                return res.status(401).json({ error: 'Invalid signature' });
-            }
-            console.log('✅ Signature verified');
-        }
-
-        const event = JSON.parse(body);
-        console.log('📦 Event:', event.type);
-
-        const orderId = event.data?.order_id || event.order_id;
-        const status = event.type || event.status;
-
-        if (db && orderId) {
-            if (status === 'payment.success' || status === 'success') {
-                await db.ref('orders/' + orderId).update({
-                    status: 'Processing',
-                    paymentStatus: 'paid',
-                    paidAt: Date.now(),
-                    transactionId: event.data?.transaction_id || '',
-                    webhookData: event
-                });
-                console.log('✅ Order PAID:', orderId);
-            } else if (status === 'payment.failed' || status === 'failed') {
-                await db.ref('orders/' + orderId).update({
-                    status: 'Cancelled',
-                    paymentStatus: 'failed',
-                    failedAt: Date.now(),
-                    webhookData: event
-                });
-                console.log('❌ Order FAILED:', orderId);
-            }
-        }
-
-        res.json({ received: true });
-
-    } catch (error) {
-        console.error('Webhook error:', error.message);
-        res.status(400).json({ error: 'Bad request' });
-    }
-});
-
-// ═══ ROUTE 5: RETURN URL ═══
+/* ═══════════════════════════════════════════════════════
+   ROUTE 5: RETURN URL
+   ═══════════════════════════════════════════════════════ */
 app.get('/api/return', (req, res) => {
     const { order_id } = req.query;
     res.redirect(`${process.env.FRONTEND_URL || 'https://siddiquemarkett.netlify.app'}/#success=${order_id}`);
 });
 
-// ═══ HEALTH CHECK ═══
+/* ═══════════════════════════════════════════════════════
+   HEALTH CHECK
+   ═══════════════════════════════════════════════════════ */
 app.get('/', (req, res) => {
     res.json({ status: 'ok', service: 'Siddique Payment Backend' });
 });
 
-// ═══ START ═══
+/* ═══════════════════════════════════════════════════════
+   START
+   ═══════════════════════════════════════════════════════ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
